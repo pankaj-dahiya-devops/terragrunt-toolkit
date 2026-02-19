@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+Terragrunt Format - Filter and clean up terragrunt plan output.
+
+This utility removes noise from interleaved terragrunt plan-all output,
+making it easier to review changes.
+
+Usage:
+    terragrunt_format [FILE]
+    cat plan_output.txt | terragrunt_format
+
+Examples:
+    # Filter a file
+    ./terragrunt_format plan_output.txt
+
+    # Filter from stdin
+    terragrunt plan-all 2>&1 | ./terragrunt_format
+
+    # Filter from stdin (explicit)
+    ./terragrunt_format -
+
+# =============================================================================
+# PYTHON CONCEPTS FOR GO/BASH DEVELOPERS
+# =============================================================================
+#
+# This file demonstrates these Python concepts:
+#
+# 1. Text Streams (TextIO):
+#    - Python's abstraction for text input/output
+#    - sys.stdin and sys.stdout are TextIO streams
+#    - Files opened with open() return TextIO objects
+#    - Can iterate over lines: for line in stream
+#
+# 2. Piping / Standard Input:
+#    - sys.stdin reads from standard input (piped data)
+#    - "-" as filename conventionally means stdin
+#    - Go equivalent: os.Stdin
+#    - Bash equivalent: Reading from pipe or < redirection
+#
+# 3. Compiled Regular Expressions:
+#    - re.compile() pre-compiles patterns for efficiency
+#    - pattern.search(string) finds first match anywhere in string
+#    - pattern.sub(replacement, string) replaces matches
+#
+# 4. File Context (open/close):
+#    - open() returns file handle that must be closed
+#    - We track whether to close in close_output variable
+#    - Alternative: use 'with open(...)' context manager
+#
+# =============================================================================
+"""
+
+# =============================================================================
+# STANDARD LIBRARY IMPORTS
+# =============================================================================
+
+import re              # Regular expressions for pattern matching
+import sys             # Standard streams (stdin, stdout, stderr)
+import argparse        # Command-line argument parsing
+from pathlib import Path    # Object-oriented filesystem paths
+from typing import TextIO, Optional  # Type hints
+
+# =============================================================================
+# FILTER PATTERNS
+# =============================================================================
+#
+# These regex patterns match "noise" lines in terragrunt/terraform output.
+# Lines matching these patterns are removed from the output.
+#
+# PYTHON CONCEPT - Compiled Regex:
+# re.compile() creates a Pattern object that can be reused efficiently.
+# This is faster than calling re.search(pattern, string) repeatedly.
+#
+# Go equivalent: regexp.MustCompile() (compile once, reuse)
+# Bash equivalent: grep -v "pattern" (filter out matching lines)
+#
+# PATTERN EXPLANATIONS:
+# - ^ at start means "beginning of line"
+# - \. means literal dot (. alone matches any character)
+# - \s+ means one or more whitespace characters
+# - .+ means one or more of any character
+# - $ at end means "end of line"
+# - [.+]? means optional literal brackets with content
+# =============================================================================
+
+FILTER_PATTERNS = [
+    # Message about where plan was saved (not useful in aggregate output)
+    re.compile(r"^This plan was saved to:"),
+
+    # Lock release message (noise)
+    re.compile(r"^Releasing state lock\."),
+
+    # Instructions to run terraform apply (not relevant for review)
+    re.compile(r"^To perform exactly these actions"),
+    re.compile(r"\s+terraform apply \""),
+
+    # Refresh messages (noise during plan)
+    re.compile(r"^Refreshing Terraform state in-memory prior to plan\.\.\."),
+    re.compile(r"The refreshed state will be used"),
+    re.compile(r"persisted to local or remote state storage"),
+    re.compile(r"Refreshing state\.\.\.( \[.+\])?$"),  # Optional [resource] suffix
+
+    # Generic plan generation message (appears in every plan)
+    re.compile(r"An execution plan has been generated"),
+
+    # Lock acquisition message (noise)
+    re.compile(r"Acquiring state lock\. This may take a few moments\.\.\."),
+
+    # Multi-line "no changes" explanation (we count these instead)
+    re.compile(r"This means that Terraform did not detect any differences between your"),
+    re.compile(r"configuration and real physical resources that exist\. As a result, no"),
+    re.compile(r"actions need to be performed\."),
+]
+
+# =============================================================================
+# NO CHANGE PATTERN
+# =============================================================================
+#
+# This pattern matches the "No changes" message from terraform.
+# Instead of filtering these out, we count them and show a summary.
+# This helps quickly see how many providers had no changes.
+# =============================================================================
+
+NO_CHANGE_PATTERN = re.compile(r"No changes\. Infrastructure is up-to-date\.")
+
+
+# =============================================================================
+# FORMAT FUNCTION
+# =============================================================================
+
+def format_plan_output(input_stream: TextIO, output_stream: TextIO) -> int:
+    """
+    Filter terragrunt plan output.
+
+    This function:
+    1. Reads input line by line
+    2. Filters out noise lines matching FILTER_PATTERNS
+    3. Counts "no changes" messages
+    4. Collapses multiple separators and blank lines
+    5. Writes cleaned output with summary
+
+    Args:
+        input_stream: Input file or stdin (TextIO object)
+        output_stream: Output file or stdout (TextIO object)
+
+    Returns:
+        Count of "no change" plans found
+
+    PYTHON CONCEPTS:
+
+    1. TextIO Type:
+       - Abstract type for text streams (files, stdin/stdout)
+       - Can iterate with 'for line in stream'
+       - Has .read(), .write(), .readline() methods
+
+    2. Iterating Over File:
+       - 'for line in input_stream' reads one line at a time
+       - Lines include the trailing newline character
+       - Memory efficient (doesn't load entire file)
+
+       Go equivalent:
+           scanner := bufio.NewScanner(reader)
+           for scanner.Scan() {
+               line := scanner.Text()
+           }
+
+       Bash equivalent:
+           while IFS= read -r line; do
+               # process $line
+           done < file
+
+    3. re.sub() for Replacement:
+       - re.sub(pattern, replacement, string) replaces all matches
+       - r"\1" in replacement refers to first capture group
+    """
+    no_change_count = 0
+    output_lines = []
+
+    # -------------------------------------------------------------------------
+    # PROCESS EACH LINE
+    # -------------------------------------------------------------------------
+    for line in input_stream:
+        # Check for "no changes" message (count but don't output)
+        if NO_CHANGE_PATTERN.search(line):
+            no_change_count += 1
+            continue  # Skip this line
+
+        # Check if line matches any filter pattern
+        should_filter = False
+        for pattern in FILTER_PATTERNS:
+            if pattern.search(line):
+                # pattern.search() returns a Match object if found, None otherwise
+                # Any truthy match means we should filter this line
+                should_filter = True
+                break  # No need to check other patterns
+
+        if not should_filter:
+            output_lines.append(line)
+
+    # -------------------------------------------------------------------------
+    # JOIN AND CLEAN UP OUTPUT
+    # -------------------------------------------------------------------------
+
+    # Join all lines into single string
+    # "".join(list) is like strings.Join(slice, "") in Go
+    output = "".join(output_lines)
+
+    # -------------------------------------------------------------------------
+    # COLLAPSE MULTIPLE SEPARATORS
+    # -------------------------------------------------------------------------
+    # Terraform output often has separator lines like:
+    #   --------
+    #   --------
+    #   --------
+    # This regex collapses them into a single line.
+    #
+    # Pattern explanation:
+    # - (-+) matches one or more dashes (captured in group 1)
+    # - ((\n)+-+)+ matches newline(s) followed by dashes, one or more times
+    # - r"\1" replaces with just the first dash group
+    # -------------------------------------------------------------------------
+    output = re.sub(r"(-+)((\n)+-+)+", r"\1", output)
+
+    # -------------------------------------------------------------------------
+    # COLLAPSE MULTIPLE BLANK LINES
+    # -------------------------------------------------------------------------
+    # Multiple blank lines in a row are collapsed to maximum of two.
+    # This keeps the output readable without excessive whitespace.
+    #
+    # Pattern explanation:
+    # - (\n\n) matches two newlines (blank line, captured)
+    # - \n+ matches additional newlines
+    # - r"\1" replaces with just two newlines
+    # -------------------------------------------------------------------------
+    output = re.sub(r"(\n\n)\n+", r"\1", output)
+
+    # -------------------------------------------------------------------------
+    # WRITE OUTPUT
+    # -------------------------------------------------------------------------
+    output_stream.write(output)
+
+    # Add summary line at the end
+    output_stream.write(f"\nNo Change Plans: {no_change_count}\n")
+
+    return no_change_count
+
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace with file and output attributes
+    """
+    parser = argparse.ArgumentParser(
+        description="Filter and clean up terragrunt plan output",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s plan_output.txt              Filter a file
+  cat plan.txt | %(prog)s               Filter from stdin
+  terragrunt plan-all 2>&1 | %(prog)s   Filter live output
+        """,
+    )
+
+    # -------------------------------------------------------------------------
+    # INPUT FILE ARGUMENT
+    # -------------------------------------------------------------------------
+    # nargs="?" means optional (0 or 1 argument)
+    # default="-" means stdin if not provided
+    # The "-" convention for stdin is common in Unix tools
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "file",
+        nargs="?",           # Optional positional argument
+        default="-",         # Default to stdin
+        metavar="FILE",
+        help="Input file (default: stdin, use '-' for stdin)",
+    )
+
+    # -------------------------------------------------------------------------
+    # OUTPUT FILE OPTION
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "-o", "--output",
+        metavar="FILE",
+        help="Output file (default: stdout)",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+def main() -> int:
+    """
+    Main entry point.
+
+    Handles input/output stream setup and cleanup.
+
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    args = parse_args()
+
+    # -------------------------------------------------------------------------
+    # DETERMINE INPUT SOURCE
+    # -------------------------------------------------------------------------
+    #
+    # PYTHON CONCEPT - Type Annotation with Assignment:
+    # input_stream: TextIO declares the variable type for the IDE/type checker
+    # The actual assignment happens in the if/else block
+    #
+    # sys.stdin is Python's standard input stream
+    # It's automatically connected to piped input or terminal
+    #
+    # Go equivalent: os.Stdin
+    # Bash equivalent: /dev/stdin or $0 (reading from pipe)
+    # -------------------------------------------------------------------------
+
+    input_stream: TextIO  # Type declaration (no assignment yet)
+
+    if args.file == "-" or args.file is None:
+        # Read from standard input
+        input_stream = sys.stdin
+    else:
+        # Read from file
+        input_path = Path(args.file)
+        if not input_path.exists():
+            # Print error to stderr (not stdout, which might be piped)
+            print(f"ERROR: File not found: {args.file}", file=sys.stderr)
+            return 1
+
+        # open() returns a file object (TextIO)
+        # "r" mode is read-only text mode (default)
+        input_stream = open(input_path, "r")
+
+    # -------------------------------------------------------------------------
+    # DETERMINE OUTPUT DESTINATION
+    # -------------------------------------------------------------------------
+    #
+    # Track whether we need to close the output stream.
+    # sys.stdout should not be closed, but file handles should be.
+    # -------------------------------------------------------------------------
+
+    output_stream: TextIO
+    close_output = False  # Track whether we opened the file
+
+    if args.output:
+        # Write to file
+        output_stream = open(args.output, "w")  # "w" = write mode
+        close_output = True
+    else:
+        # Write to standard output
+        output_stream = sys.stdout
+
+    # -------------------------------------------------------------------------
+    # PROCESS AND CLEANUP
+    # -------------------------------------------------------------------------
+    #
+    # try/finally ensures we close file handles even if an exception occurs.
+    # This is important for proper resource cleanup.
+    #
+    # Alternative approach using context managers:
+    #   with open(input_path) as input_stream, open(output_path, "w") as output_stream:
+    #       format_plan_output(input_stream, output_stream)
+    #
+    # The context manager approach is cleaner but harder to use with stdin/stdout.
+    # -------------------------------------------------------------------------
+
+    try:
+        format_plan_output(input_stream, output_stream)
+        return 0
+    finally:
+        # Close file handles (but not stdin/stdout)
+        if input_stream != sys.stdin:
+            input_stream.close()
+        if close_output:
+            output_stream.close()
+
+
+# =============================================================================
+# SCRIPT ENTRY POINT
+# =============================================================================
+#
+# __name__ == "__main__" ensures main() only runs when executed directly,
+# not when imported as a module.
+# =============================================================================
+
+if __name__ == "__main__":
+    sys.exit(main())

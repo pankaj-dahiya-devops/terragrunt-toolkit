@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+"""
+Terragrunt Unlock All - Manage S3 state lock files.
+
+This script scans S3 buckets for Terraform lock files (.tflock) and
+provides options to view and remove stale locks.
+
+Terraform S3 backend with `use_lockfile = true` stores lock files as:
+  s3://<bucket>/<key>.tflock
+
+Usage:
+    terragrunt_unlock_all [OPTIONS]
+
+Examples:
+    # List all locks in a bucket
+    ./terragrunt_unlock_all -b mybucket --dry-run
+
+    # List locks for a specific environment
+    ./terragrunt_unlock_all -b mybucket --prefix env/prod/
+
+    # Remove locks older than 24 hours
+    ./terragrunt_unlock_all -b mybucket --age 24h --confirm
+
+    # Remove only your own locks
+    ./terragrunt_unlock_all -b mybucket -u myuser@host --confirm
+
+# =============================================================================
+# PYTHON CONCEPTS FOR GO/BASH DEVELOPERS
+# =============================================================================
+#
+# This file demonstrates these additional Python concepts:
+#
+# 1. boto3 (AWS SDK for Python):
+#    - Official AWS SDK for interacting with AWS services
+#    - Similar to Go's aws-sdk-go or Bash's aws-cli
+#    - Uses "clients" for each service (s3, ec2, etc.)
+#
+# 2. Paginator Pattern:
+#    - AWS API responses are paginated (max 1000 objects per request)
+#    - boto3 paginator handles this automatically
+#    - In Go, you'd handle pagination manually with NextToken
+#
+# 3. Optional Imports with try/except:
+#    - boto3 is not in standard library, needs pip install
+#    - try/except at import time gives friendly error message
+#    - Go would fail at compile time if package missing
+#
+# 4. datetime with timezone:
+#    - Python datetime can be "naive" (no timezone) or "aware"
+#    - AWS returns UTC timestamps with timezone
+#    - timezone.utc is Python's UTC timezone object
+#
+# 5. getpass Module:
+#    - getpass.getuser() gets current username
+#    - socket.gethostname() gets machine hostname
+#    - Bash equivalent: $(whoami)@$(hostname)
+#
+# =============================================================================
+"""
+
+# =============================================================================
+# STANDARD LIBRARY IMPORTS
+# =============================================================================
+
+import os              # Operating system interface (environ)
+import re              # Regular expressions (for duration parsing)
+import sys             # System-specific parameters (path, exit)
+import json            # JSON parsing (for lock file content)
+import getpass         # Get current username without prompting
+import socket          # Network utilities (for hostname)
+import argparse        # Command-line argument parsing
+from pathlib import Path               # Object-oriented filesystem paths
+from datetime import datetime, timedelta, timezone  # Date/time handling
+from concurrent.futures import ThreadPoolExecutor, as_completed  # Parallel execution
+from typing import Optional, List, Dict, Any  # Type hints
+
+# =============================================================================
+# PATH SETUP FOR LOCAL IMPORTS
+# =============================================================================
+
+script_dir = Path(__file__).parent.resolve()
+sys.path.insert(0, str(script_dir))
+
+# =============================================================================
+# LOCAL MODULE IMPORTS
+# =============================================================================
+
+from lib.common import (
+    debug,             # Print debug messages (only if verbose)
+    info,              # Print informational messages
+    warn,              # Print warning messages (yellow)
+    error,             # Print error messages (red)
+    set_verbose,       # Function to enable/disable verbose mode
+    is_interactive,    # Check if running in interactive terminal
+)
+
+# =============================================================================
+# OPTIONAL IMPORT: boto3 (AWS SDK)
+# =============================================================================
+#
+# boto3 is not part of Python's standard library. It must be installed with pip.
+# We use try/except to provide a friendly error message if it's missing.
+#
+# PYTHON CONCEPT - Import Error Handling:
+# Unlike Go (which fails at compile time for missing packages), Python can
+# catch import errors at runtime and provide helpful guidance.
+#
+# Go equivalent: Would fail during "go build" with package not found
+# Bash equivalent: Check for aws-cli with "which aws" or "command -v aws"
+# =============================================================================
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+except ImportError:
+    print("ERROR: boto3 is required. Install with: pip install boto3")
+    sys.exit(1)
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def get_current_user() -> str:
+    """
+    Get current user identifier (user@hostname).
+
+    This is used as the default filter to show only the current user's locks.
+
+    Returns:
+        String in format "username@hostname"
+
+    PYTHON CONCEPTS:
+    - getpass.getuser(): Gets username without prompting for password
+      Go equivalent: os.Getenv("USER") or exec.Command("whoami")
+      Bash equivalent: $(whoami)
+
+    - socket.gethostname(): Gets the machine's hostname
+      Go equivalent: os.Hostname()
+      Bash equivalent: $(hostname)
+    """
+    try:
+        username = getpass.getuser()
+        hostname = socket.gethostname()
+        return f"{username}@{hostname}"
+    except Exception:
+        # Fallback if we can't determine user/host
+        return "unknown"
+
+
+def parse_duration(duration_str: str) -> timedelta:
+    """
+    Parse a duration string like "6h", "24h", "7d" into a timedelta.
+
+    Supported formats:
+    - Xw: weeks (e.g., "1w" = 1 week)
+    - Xd: days (e.g., "7d" = 7 days)
+    - Xh: hours (e.g., "6h" = 6 hours)
+    - Xm: minutes (e.g., "30m" = 30 minutes)
+    - Xs: seconds (e.g., "60s" = 60 seconds)
+
+    Can combine: "1d12h" = 1 day and 12 hours
+
+    Args:
+        duration_str: Duration string like "6h", "24h", "7d", "1d12h"
+
+    Returns:
+        timedelta object representing the duration
+
+    Raises:
+        ValueError: If duration format is invalid
+
+    PYTHON CONCEPTS:
+    - re.compile(): Creates a compiled regex pattern for efficiency
+    - pattern.findall(): Returns all non-overlapping matches
+    - timedelta: Represents a duration (difference between two datetimes)
+
+    Go equivalent: time.ParseDuration() (but only supports h, m, s, not d, w)
+    Bash equivalent: Manual parsing with awk/sed
+    """
+    total_seconds = 0
+
+    # Pattern matches digit(s) followed by unit letter
+    # r"..." is a raw string (backslashes not escaped)
+    # (\d+) captures one or more digits
+    # ([wdhms]) captures the unit letter
+    pattern = re.compile(r"(\d+)([wdhms])")
+
+    # findall returns list of tuples: [("24", "h"), ("7", "d")]
+    matches = pattern.findall(duration_str)
+    if not matches:
+        raise ValueError(f"Invalid duration format: {duration_str}")
+
+    # Convert each match to seconds and accumulate
+    for value, unit in matches:
+        value = int(value)
+        if unit == "w":
+            total_seconds += value * 7 * 24 * 60 * 60  # weeks
+        elif unit == "d":
+            total_seconds += value * 24 * 60 * 60      # days
+        elif unit == "h":
+            total_seconds += value * 60 * 60           # hours
+        elif unit == "m":
+            total_seconds += value * 60                # minutes
+        elif unit == "s":
+            total_seconds += value                     # seconds
+
+    return timedelta(seconds=total_seconds)
+
+
+def parse_lock_info(lock_content: str) -> Dict[str, Any]:
+    """
+    Parse lock file content (JSON format).
+
+    Terraform lock files contain JSON with fields like:
+    {
+        "ID": "unique-id",
+        "Operation": "OperationTypePlan",
+        "Who": "user@hostname",
+        "Version": "1.5.0",
+        "Created": "2024-01-01T12:00:00.000000000Z"
+    }
+
+    Args:
+        lock_content: Raw content of the lock file (JSON string)
+
+    Returns:
+        Dictionary with parsed lock info, or empty dict if parsing fails
+
+    PYTHON CONCEPT - JSON Parsing:
+    - json.loads() parses a JSON string into Python dict/list
+    - json.load() reads from a file object (not used here)
+
+    Go equivalent: json.Unmarshal([]byte(content), &result)
+    Bash equivalent: jq '.' <<< "$content"
+    """
+    try:
+        return json.loads(lock_content)
+    except json.JSONDecodeError:
+        return {}
+
+
+# =============================================================================
+# S3 OPERATIONS
+# =============================================================================
+
+def find_locks(
+    s3_client: Any,
+    bucket: str,
+    prefix: str = "",
+    user_filter: Optional[str] = None,
+    max_age: Optional[timedelta] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Scan S3 bucket for .tflock files.
+
+    This function lists all objects in the bucket (with optional prefix filter)
+    and returns information about any .tflock files found.
+
+    Args:
+        s3_client: boto3 S3 client instance
+        bucket: S3 bucket name
+        prefix: Optional prefix to filter by (e.g., "env/prod/")
+        user_filter: Optional user to filter by (e.g., "user@hostname")
+        max_age: Optional maximum age - only include locks older than this
+
+    Returns:
+        List of lock dictionaries, each containing:
+        - bucket: S3 bucket name
+        - key: Full S3 key (path) to lock file
+        - state_key: S3 key without .tflock extension
+        - user: Who created the lock
+        - operation: What operation created the lock (Plan, Apply)
+        - id: Lock ID
+        - created: When the lock was created
+        - info: Raw parsed JSON from lock file
+
+    BOTO3 CONCEPTS:
+
+    1. Paginator:
+       - S3 list_objects_v2 returns max 1000 objects per request
+       - Paginator automatically handles multiple requests
+       - You iterate over pages, each page has up to 1000 objects
+
+       Go equivalent:
+           for {
+               resp, _ := svc.ListObjectsV2(&s3.ListObjectsV2Input{...})
+               // process resp.Contents
+               if !*resp.IsTruncated { break }
+               input.ContinuationToken = resp.NextContinuationToken
+           }
+
+       Bash equivalent: aws s3api list-objects-v2 --bucket $BUCKET
+
+    2. get_object():
+       - Downloads an object from S3
+       - Returns a dict with "Body" containing a streaming response
+       - .read() gets the full content as bytes
+
+    3. ClientError:
+       - boto3 raises ClientError for AWS API errors
+       - Error details in e.response["Error"]["Code"] and ["Message"]
+    """
+    locks = []
+
+    # -------------------------------------------------------------------------
+    # CREATE PAGINATOR
+    # -------------------------------------------------------------------------
+    # get_paginator() returns a paginator for the specified API operation
+    # paginate() returns an iterator over result pages
+    # -------------------------------------------------------------------------
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    info(f"Scanning s3://{bucket}/{prefix} for lock files...")
+
+    try:
+        # Iterate over all pages of results
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            # Each page has a "Contents" list of objects (or empty if no objects)
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+
+                # -----------------------------------------------------------------
+                # FILTER: Only process .tflock files
+                # -----------------------------------------------------------------
+                # Terraform S3 backend with use_lockfile=true creates .tflock files
+                # -----------------------------------------------------------------
+                if not key.endswith(".tflock"):
+                    continue
+
+                # -----------------------------------------------------------------
+                # READ LOCK FILE CONTENT
+                # -----------------------------------------------------------------
+                try:
+                    # get_object downloads the file
+                    response = s3_client.get_object(Bucket=bucket, Key=key)
+
+                    # response["Body"] is a StreamingBody
+                    # .read() returns bytes, .decode("utf-8") converts to string
+                    lock_content = response["Body"].read().decode("utf-8")
+
+                    # Parse the JSON content
+                    lock_info = parse_lock_info(lock_content)
+
+                except ClientError as e:
+                    # Log warning but continue processing other files
+                    warn(f"Could not read {key}: {e}")
+                    continue
+
+                # -----------------------------------------------------------------
+                # BUILD LOCK DICTIONARY
+                # -----------------------------------------------------------------
+                lock = {
+                    "bucket": bucket,
+                    "key": key,
+                    # Remove .tflock suffix to get the state file key
+                    "state_key": key[:-7] if key.endswith(".tflock") else key,
+                    "user": lock_info.get("Who", "unknown"),
+                    "operation": lock_info.get("Operation", "unknown"),
+                    "id": lock_info.get("ID", ""),
+                    "version": lock_info.get("Version", ""),
+                    "created": None,
+                    "info": lock_info,
+                    "last_modified": obj.get("LastModified"),
+                }
+
+                # -----------------------------------------------------------------
+                # PARSE CREATION TIME
+                # -----------------------------------------------------------------
+                # Terraform uses RFC3339 format (ISO 8601 with Z for UTC)
+                # Python's datetime.fromisoformat() can parse this
+                # -----------------------------------------------------------------
+                if "Created" in lock_info:
+                    try:
+                        created_str = lock_info["Created"]
+                        # Convert "Z" suffix to "+00:00" for fromisoformat()
+                        if created_str.endswith("Z"):
+                            created_str = created_str[:-1] + "+00:00"
+                        lock["created"] = datetime.fromisoformat(created_str)
+                    except (ValueError, TypeError):
+                        # Fallback to S3 LastModified timestamp
+                        lock["created"] = obj.get("LastModified")
+                else:
+                    lock["created"] = obj.get("LastModified")
+
+                # -----------------------------------------------------------------
+                # APPLY USER FILTER
+                # -----------------------------------------------------------------
+                if user_filter and user_filter != lock["user"]:
+                    continue
+
+                # -----------------------------------------------------------------
+                # APPLY AGE FILTER
+                # -----------------------------------------------------------------
+                # Only include locks OLDER than max_age
+                # This is useful for cleaning up stale locks
+                # -----------------------------------------------------------------
+                if max_age and lock["created"]:
+                    # Calculate cutoff time
+                    cutoff = datetime.now(timezone.utc) - max_age
+
+                    # Ensure lock["created"] has timezone info
+                    if lock["created"].tzinfo is None:
+                        lock["created"] = lock["created"].replace(tzinfo=timezone.utc)
+
+                    # Skip if lock is newer than cutoff
+                    if lock["created"] > cutoff:
+                        continue
+
+                locks.append(lock)
+
+    except ClientError as e:
+        error(f"Failed to list objects: {e}")
+
+    return locks
+
+
+def show_lock(lock: Dict[str, Any]) -> None:
+    """
+    Display information about a lock.
+
+    Args:
+        lock: Lock dictionary from find_locks()
+    """
+    info(f"  {lock['state_key']}")
+    info(f"    Locked by: {lock['user']}")
+    info(f"    Operation: {lock['operation']}")
+    info(f"    Created:   {lock['created']}")
+    if lock["id"]:
+        info(f"    Lock ID:   {lock['id']}")
+
+
+def delete_lock(s3_client: Any, lock: Dict[str, Any], dry_run: bool = False) -> bool:
+    """
+    Delete a lock file from S3.
+
+    Args:
+        s3_client: boto3 S3 client
+        lock: Lock dictionary from find_locks()
+        dry_run: If True, only print what would be done
+
+    Returns:
+        True if successful (or dry_run), False otherwise
+
+    BOTO3 CONCEPT - delete_object():
+    - Deletes a single object from S3
+    - Returns success even if object doesn't exist (idempotent)
+    - Raises ClientError for permission errors or other issues
+
+    Go equivalent: svc.DeleteObject(&s3.DeleteObjectInput{...})
+    Bash equivalent: aws s3 rm s3://$BUCKET/$KEY
+    """
+    bucket = lock["bucket"]
+    key = lock["key"]
+
+    if dry_run:
+        info(f"Would delete: s3://{bucket}/{key}")
+        return True
+
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+        info(f"Deleted: s3://{bucket}/{key}")
+        return True
+    except ClientError as e:
+        error(f"Failed to delete {key}: {e}")
+        return False
+
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace with all parsed arguments
+    """
+    parser = argparse.ArgumentParser(
+        description="Manage Terraform S3 state lock files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -b mybucket --dry-run                    List all locks
+  %(prog)s -b mybucket --prefix env/prod/           List locks for prod
+  %(prog)s -b mybucket --age 24h --confirm          Remove locks older than 24h
+  %(prog)s -b mybucket -u myuser@host --confirm     Remove only your locks
+        """,
+    )
+
+    # -------------------------------------------------------------------------
+    # REQUIRED ARGUMENTS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-b", "--bucket",
+        required=True,                # This argument is mandatory
+        metavar="BUCKET",
+        help="S3 bucket name containing state files",
+    )
+
+    # -------------------------------------------------------------------------
+    # S3 FILTERING OPTIONS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--prefix",
+        default="",
+        metavar="PREFIX",
+        help="S3 key prefix to filter by (e.g., 'env/prod/')",
+    )
+
+    # -------------------------------------------------------------------------
+    # AWS CONFIGURATION OPTIONS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-p", "--profile",
+        metavar="PROFILE",
+        help="AWS profile to use",
+    )
+
+    parser.add_argument(
+        "-r", "--region",
+        metavar="REGION",
+        help="AWS region (default: from AWS config)",
+    )
+
+    # -------------------------------------------------------------------------
+    # LOCK FILTERING OPTIONS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-u", "--user",
+        metavar="USER",
+        help=f"Filter by lock owner (default: {get_current_user()}, use 'all' for all users)",
+    )
+
+    parser.add_argument(
+        "-a", "--age",
+        metavar="DURATION",
+        help="Filter locks older than specified age (e.g., 6h, 24h, 7d)",
+    )
+
+    # -------------------------------------------------------------------------
+    # EXECUTION OPTIONS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-j", "--concurrency",
+        type=int,
+        default=int(os.environ.get("CONCURRENCY", 5)),
+        metavar="N",
+        help="Parallel delete operations (default: %(default)s)",
+    )
+
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Delete locks without prompting",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show locks but do not delete them",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+def main() -> int:
+    """
+    Main entry point.
+
+    Workflow:
+    1. Parse arguments
+    2. Create boto3 S3 client
+    3. Find all matching lock files
+    4. Display lock information
+    5. Delete locks (if confirmed)
+
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
+    args = parse_args()
+
+    # Set verbose mode
+    if args.verbose:
+        set_verbose(True)
+
+    # -------------------------------------------------------------------------
+    # PARSE USER FILTER
+    # -------------------------------------------------------------------------
+    # Default behavior: filter to current user's locks only
+    # -u all: show all users' locks
+    # -u specific_user: show only that user's locks
+    # -------------------------------------------------------------------------
+
+    user_filter: Optional[str] = None
+    if args.user:
+        if args.user.lower() == "all":
+            user_filter = None  # No filter = all users
+        else:
+            user_filter = args.user
+    else:
+        # Default to current user
+        user_filter = get_current_user()
+
+    # -------------------------------------------------------------------------
+    # PARSE AGE FILTER
+    # -------------------------------------------------------------------------
+
+    max_age: Optional[timedelta] = None
+    if args.age:
+        try:
+            max_age = parse_duration(args.age)
+        except ValueError as e:
+            error(str(e))
+            return 2
+
+    # -------------------------------------------------------------------------
+    # CREATE BOTO3 S3 CLIENT
+    # -------------------------------------------------------------------------
+    #
+    # BOTO3 CONCEPTS:
+    #
+    # 1. Session:
+    #    - Holds AWS credentials and config
+    #    - Can use specific profile or region
+    #    - Default session uses AWS_* env vars or ~/.aws/credentials
+    #
+    # 2. Client:
+    #    - Low-level service interface (one method per API call)
+    #    - Created from session with session.client("s3")
+    #
+    # 3. head_bucket():
+    #    - Quick API call to test bucket access
+    #    - Returns 404 if bucket doesn't exist
+    #    - Returns 403 if access denied
+    #
+    # Go equivalent:
+    #     cfg, _ := config.LoadDefaultConfig(ctx)
+    #     client := s3.NewFromConfig(cfg)
+    #
+    # Bash equivalent:
+    #     aws s3api head-bucket --bucket $BUCKET
+    # -------------------------------------------------------------------------
+
+    try:
+        # Build session kwargs based on provided options
+        session_kwargs = {}
+        if args.profile:
+            session_kwargs["profile_name"] = args.profile
+        if args.region:
+            session_kwargs["region_name"] = args.region
+
+        # Create session and client
+        # ** unpacks dictionary as keyword arguments
+        session = boto3.Session(**session_kwargs)
+        s3_client = session.client("s3")
+
+        # Test bucket access with a lightweight API call
+        s3_client.head_bucket(Bucket=args.bucket)
+
+    except NoCredentialsError:
+        error("AWS credentials not found. Configure with 'aws configure' or set AWS_* environment variables.")
+        return 1
+
+    except ClientError as e:
+        # Parse the error code from the response
+        error_code = e.response.get("Error", {}).get("Code", "Unknown")
+        if error_code == "404":
+            error(f"Bucket '{args.bucket}' not found")
+        elif error_code == "403":
+            error(f"Access denied to bucket '{args.bucket}'")
+        else:
+            error(f"Failed to access bucket: {e}")
+        return 1
+
+    # -------------------------------------------------------------------------
+    # FIND LOCKS
+    # -------------------------------------------------------------------------
+
+    locks = find_locks(
+        s3_client,
+        args.bucket,
+        prefix=args.prefix,
+        user_filter=user_filter,
+        max_age=max_age,
+    )
+
+    if not locks:
+        info("No matching locks found")
+        return 0
+
+    # -------------------------------------------------------------------------
+    # DISPLAY LOCKS
+    # -------------------------------------------------------------------------
+
+    # Build descriptive message about filters
+    user_msg = f" belonging to {user_filter}" if user_filter else ""
+    age_msg = f" older than {args.age}" if args.age else ""
+    info(f"\nFound {len(locks)} lock(s){user_msg}{age_msg}:\n")
+
+    for lock in locks:
+        show_lock(lock)
+        print()  # Blank line between locks
+
+    # -------------------------------------------------------------------------
+    # DRY RUN CHECK
+    # -------------------------------------------------------------------------
+
+    if args.dry_run:
+        info("Dry run - no locks were deleted")
+        return 0
+
+    # -------------------------------------------------------------------------
+    # CONFIRM DELETION
+    # -------------------------------------------------------------------------
+    #
+    # Safety measure: require explicit confirmation before deleting locks
+    # - --confirm flag skips the prompt
+    # - Interactive mode prompts for "yes"
+    # - Non-interactive mode requires --confirm
+    # -------------------------------------------------------------------------
+
+    if not args.confirm:
+        if is_interactive():
+            print("Enter 'yes' to confirm unlocking: ", end="", flush=True)
+            response = input().strip()
+            if response != "yes":
+                info("Aborted")
+                return 1
+        else:
+            error("--confirm required for non-interactive mode")
+            return 1
+
+    # -------------------------------------------------------------------------
+    # DELETE LOCKS IN PARALLEL
+    # -------------------------------------------------------------------------
+    #
+    # Use ThreadPoolExecutor for parallel deletion
+    # Same pattern as plan_all and apply_all
+    # -------------------------------------------------------------------------
+
+    info(f"\nDeleting {len(locks)} lock(s)...")
+    success_count = 0
+    error_count = 0
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        # Submit all delete operations
+        futures = {
+            executor.submit(delete_lock, s3_client, lock, False): lock
+            for lock in locks
+        }
+
+        # Process results as they complete
+        for future in as_completed(futures):
+            if future.result():
+                success_count += 1
+            else:
+                error_count += 1
+
+    # -------------------------------------------------------------------------
+    # SUMMARY
+    # -------------------------------------------------------------------------
+
+    info(f"\nDeleted {success_count} lock(s)")
+    if error_count > 0:
+        error(f"Failed to delete {error_count} lock(s)")
+        return 1
+
+    return 0
+
+
+# =============================================================================
+# SCRIPT ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    sys.exit(main())

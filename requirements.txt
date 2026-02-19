@@ -1,0 +1,21 @@
+# Terragrunt Tools - Python Dependencies
+
+# AWS SDK for S3 state lock management (terragrunt_unlock_all)
+boto3>=1.26.0
+
+# Core modules used from Python standard library (no installation needed):
+# - argparse: CLI argument parsing
+# - concurrent.futures: Parallel execution (ThreadPoolExecutor)
+# - subprocess: Running terragrunt/terraform commands
+# - pathlib: Cross-platform path handling
+# - re: Regular expressions
+# - json: JSON parsing
+# - os, sys: System operations
+# - shutil: File operations
+# - typing: Type hints
+# - dataclasses: Data classes
+# - datetime: Timestamps
+# - signal: Signal handling (Unix) / threading events (Windows)
+# - zlib: CRC32 for plan digest
+# - getpass: Get current username
+# - socket: Get hostname

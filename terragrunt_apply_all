@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+Terragrunt Apply All - Apply terraform plans from a ticket directory.
+
+This script applies previously generated terraform plans in parallel,
+with safety checks for production environments.
+
+Usage:
+    terragrunt_apply_all [OPTIONS] [TICKET]
+
+Examples:
+    # Apply all plans for a ticket
+    ./terragrunt_apply_all INFRA-1234
+
+    # Retry only failed applies
+    ./terragrunt_apply_all INFRA-1234 --retry errors
+
+    # Apply with destroy plans allowed
+    ./terragrunt_apply_all INFRA-1234 --allow-destroy
+
+    # Preview what would be applied
+    ./terragrunt_apply_all INFRA-1234 --dry-run
+
+# =============================================================================
+# PYTHON CONCEPTS FOR GO/BASH DEVELOPERS
+# =============================================================================
+#
+# This file is similar to terragrunt_plan_all but simpler since it only
+# reads existing plans and applies them. Key concepts:
+#
+# 1. Safety Checks:
+#    - Production branch verification (must be on main/master)
+#    - Uncommitted changes detection
+#    - Destroy plan confirmation (requires --allow-destroy + YES prompt)
+#    - These checks can be bypassed with --force (for emergencies)
+#
+# 2. Retry Logic:
+#    - --retry errors: Only re-apply plans that failed before
+#    - --retry all: Re-apply everything including successful ones
+#    - --retry none: Skip already-applied or failed plans (silent)
+#    - Default (no flag): Show warnings about skipped plans
+#
+# 3. Workflow:
+#    Plans must be created first with terragrunt_plan_all
+#    This script reads from: tickets/<ticket>/providers/**/*.txt
+#    Apply results are saved to: <plan>.apply
+#
+# =============================================================================
+"""
+
+# =============================================================================
+# STANDARD LIBRARY IMPORTS
+# =============================================================================
+
+import os              # Operating system interface (chdir, environ)
+import sys             # System-specific parameters (path, exit, argv)
+import argparse        # Command-line argument parsing
+from pathlib import Path  # Object-oriented filesystem paths
+
+# =============================================================================
+# PATH SETUP FOR LOCAL IMPORTS
+# =============================================================================
+#
+# Add the script's directory to sys.path so we can import from lib/
+# See terragrunt_plan_all for detailed explanation of this pattern.
+# =============================================================================
+
+script_dir = Path(__file__).parent.resolve()
+sys.path.insert(0, str(script_dir))
+
+# =============================================================================
+# LOCAL MODULE IMPORTS
+# =============================================================================
+
+from lib.common import (
+    debug,             # Print debug messages (only if verbose enabled)
+    info,              # Print informational messages
+    warn,              # Print warning messages (yellow)
+    error,             # Print error messages (red)
+    set_verbose,       # Function to enable/disable verbose mode
+)
+
+# TerraformProject detects project structure
+from lib.project import TerraformProject
+
+# TerragruntApplyAll orchestrates parallel apply execution
+from lib.apply_all import TerragruntApplyAll
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Valid values for --retry option
+# - "all": Retry all applies including successful ones
+# - "errors": Only retry applies that failed before
+# - "none": Skip already-applied or failed plans (silent mode)
+RETRY_TYPES = ["all", "errors", "none"]
+
+
+# =============================================================================
+# ARGUMENT PARSING FUNCTION
+# =============================================================================
+#
+# This function defines and parses all command-line arguments.
+# Similar to terragrunt_plan_all but with fewer options since
+# apply is simpler than plan.
+#
+# KEY DIFFERENCES FROM PLAN:
+# - No --from-branch (plans must already exist)
+# - No filters (applies all plans in ticket directory)
+# - Has --force for production safety override
+# - Has --allow-destroy for destroy plan confirmation
+# - Default concurrency is 2 (safer than 5 for applies)
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace object with all parsed arguments as attributes.
+    """
+    parser = argparse.ArgumentParser(
+        description="Apply terraform plans from a ticket directory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s INFRA-1234                     Apply all plans for ticket
+  %(prog)s INFRA-1234 --retry errors      Retry only failed applies
+  %(prog)s INFRA-1234 --allow-destroy     Allow destroy plans
+  %(prog)s INFRA-1234 --dry-run           Preview what would be applied
+        """,
+    )
+
+    # -------------------------------------------------------------------------
+    # TICKET ARGUMENT (Optional Positional)
+    # -------------------------------------------------------------------------
+    #
+    # nargs="?" makes this optional (0 or 1 argument)
+    # If not provided, script tries to auto-detect from:
+    # 1. Git branch name (e.g., INFRA-1234-my-feature)
+    # 2. Current directory (e.g., tickets/INFRA-1234/)
+    #
+    # Go equivalent: flag.Arg(0) with nil check
+    # Bash equivalent: ${1:-} with empty check
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "ticket",
+        nargs="?",                # Optional (0 or 1 argument)
+        metavar="TICKET",
+        help="JIRA ticket number (INFRA-xxx)",
+    )
+
+    # -------------------------------------------------------------------------
+    # CONCURRENCY OPTION
+    # -------------------------------------------------------------------------
+    #
+    # Default is 2 for applies (more conservative than 5 for plans).
+    # Applying makes actual infrastructure changes, so we're more careful.
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "-j", "--concurrency",
+        type=int,
+        default=int(os.environ.get("CONCURRENCY", 2)),  # Lower default than plan
+        metavar="N",
+        help="Run applies in parallel (default: %(default)s)",
+    )
+
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop after first apply fails",
+    )
+
+    # -------------------------------------------------------------------------
+    # RETRY OPTION
+    # -------------------------------------------------------------------------
+    #
+    # "--retry" and "--reapply" are aliases (both work)
+    # This is done by listing both names in add_argument()
+    #
+    # choices=RETRY_TYPES restricts to ["all", "errors", "none"]
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "--retry", "--reapply",   # Two names for the same option
+        choices=RETRY_TYPES,
+        metavar="TYPE",
+        help="Retry previous applies: all, errors, or none",
+    )
+
+    parser.add_argument(
+        "--run-twice",
+        action="store_true",
+        help="Run apply twice",
+    )
+
+    # -------------------------------------------------------------------------
+    # REFRESH AND CACHE OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # Same pattern as plan script - mutually exclusive flags
+    # that get combined in the options dictionary.
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Do refresh before apply",
+    )
+
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Skip refresh before apply (default)",
+    )
+
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        default=True,
+        help="Keep terragrunt cache directory (default)",
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Remove terragrunt cache directory before apply",
+    )
+
+    # -------------------------------------------------------------------------
+    # SAFETY OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # --force: Override production branch safety checks
+    #   - Normally, applying production plans requires being on main/master
+    #   - --force allows applying from any branch (for emergencies)
+    #
+    # --allow-destroy: Enable destroy plan execution
+    #   - Destroy plans delete infrastructure
+    #   - Even with this flag, requires interactive "YES" confirmation
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow production changes while not on master|main branch",
+    )
+
+    parser.add_argument(
+        "--allow-destroy",
+        action="store_true",
+        help="Allow destroy plans to run",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only show what applies would be run and exit",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+#
+# The main entry point for the script. Workflow:
+# 1. Parse arguments
+# 2. Detect project and ticket
+# 3. Load existing plans
+# 4. Check safety requirements for production
+# 5. Execute applies
+# 6. Generate summary
+#
+# RETURN CODES:
+# - 0: Success (all applies completed without errors)
+# - 1: Runtime error (e.g., apply failed, no project found)
+# - 2: Invalid arguments or safety check failed
+# =============================================================================
+
+def main() -> int:
+    """
+    Main entry point.
+
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
+    # Parse command-line arguments
+    args = parse_args()
+
+    # -------------------------------------------------------------------------
+    # SET VERBOSE MODE
+    # -------------------------------------------------------------------------
+    if args.verbose:
+        set_verbose(True)
+
+    # -------------------------------------------------------------------------
+    # INITIALIZE PROJECT
+    # -------------------------------------------------------------------------
+    #
+    # TerraformProject() auto-detects the project root by looking for
+    # providers/ and modules/ directories. Raises RuntimeError if not found.
+    # -------------------------------------------------------------------------
+    try:
+        project = TerraformProject()
+    except RuntimeError as e:
+        if str(e):
+            error(str(e))
+        return 1
+
+    debug(f"Found {project} in {project.root}")
+    debug(f"JIRA project: {project.jira}")
+
+    # -------------------------------------------------------------------------
+    # GET TICKET (from argument or auto-detect)
+    # -------------------------------------------------------------------------
+    #
+    # Try to determine ticket from multiple sources:
+    # 1. Command-line argument (args.ticket)
+    # 2. Git branch name (if matches ticket pattern)
+    # 3. Current directory (if in tickets/<ticket>/)
+    # -------------------------------------------------------------------------
+
+    ticket = args.ticket
+
+    # Try to detect ticket from git branch name
+    if ticket is None:
+        branch = project.current_git_branch()
+        # Check if branch name matches ticket pattern (e.g., INFRA-1234 or INFRA-1234-feature)
+        if project.ticket_regex.match(branch):
+            debug(f"Assuming ticket {branch} based on current git branch")
+            ticket = branch
+
+    # Try to detect ticket from current directory
+    if ticket is None:
+        pwd_type, pwd_paths = project.parse_argument(str(Path.cwd()))
+        debug(f"pwd parsed as: {pwd_type}, {pwd_paths}")
+        if pwd_type == "ticket":
+            debug(f"Assuming ticket {pwd_paths[0]} based on current directory")
+            ticket = pwd_paths[0]
+
+    debug(f"ticket = {ticket}")
+
+    # -------------------------------------------------------------------------
+    # VALIDATE TICKET
+    # -------------------------------------------------------------------------
+
+    if ticket is None:
+        error(f"Ticket required if not on {project.jira} branch")
+        return 2
+
+    # Clean up ticket name (remove trailing slash)
+    ticket = ticket.rstrip("/")
+    if "/" in ticket:
+        error("Ticket cannot contain /")
+        return 2
+
+    # -------------------------------------------------------------------------
+    # CHECK TICKET DIRECTORY EXISTS
+    # -------------------------------------------------------------------------
+    #
+    # Unlike plan, apply requires plans to already exist.
+    # The ticket directory must have been created by a previous plan operation.
+    # -------------------------------------------------------------------------
+
+    ticket_dir = project.root / "tickets" / ticket
+    if not ticket_dir.is_dir():
+        error(f"No existing plan in tickets/{ticket}")
+        return 1
+
+    # -------------------------------------------------------------------------
+    # BUILD COMMAND OPTIONS DICTIONARY
+    # -------------------------------------------------------------------------
+    #
+    # This dictionary is passed to TerragruntApplyAll and eventually to
+    # each TerragruntApply instance.
+    # -------------------------------------------------------------------------
+
+    cmd_options = {
+        "concurrency": args.concurrency,
+        "stop_on_error": args.stop_on_error,
+        "retry": args.retry,
+        "run_twice": args.run_twice,
+        "refresh": args.refresh and not args.no_refresh,  # Combine flags
+        "tg_cache": args.cache and not args.no_cache,     # Combine flags
+        "force_apply": args.force,
+        "allow_destroy": args.allow_destroy,
+    }
+
+    # -------------------------------------------------------------------------
+    # CHANGE TO PROJECT ROOT
+    # -------------------------------------------------------------------------
+    #
+    # Save original directory for restoration in finally block.
+    # Apply operations expect to run from project root.
+    # -------------------------------------------------------------------------
+
+    original_dir = Path.cwd()
+    os.chdir(project.root)
+
+    try:
+        # ---------------------------------------------------------------------
+        # CREATE APPLY-ALL OPERATION
+        # ---------------------------------------------------------------------
+        applyall = TerragruntApplyAll(project, ticket, cmd_options)
+
+        # Load plans from ticket directory
+        # This finds all .txt files in tickets/<ticket>/providers/**/*.txt
+        applyall.load_plans()
+
+        # Display plans that will be applied
+        applyall.show_plans()
+
+        # ---------------------------------------------------------------------
+        # PRODUCTION SAFETY CHECKS
+        # ---------------------------------------------------------------------
+        #
+        # check_branch() returns a list of warning messages if there are
+        # issues with applying production plans. Issues include:
+        # - Not on main/master branch
+        # - Uncommitted changes in working directory
+        # - Local branch out of sync with remote
+        #
+        # If any issues are found:
+        # - Without --force: Show errors and exit with code 2
+        # - With --force: Show warnings but continue
+        # - With --dry-run: Show warnings but don't exit (just previewing)
+        # ---------------------------------------------------------------------
+
+        messages = applyall.check_branch()
+        if messages:
+            # Prepend a summary message
+            messages.insert(0, f"Are you sure you want to run terragrunt_apply_all on production?")
+
+            if args.force and not args.dry_run:
+                # --force overrides the safety check (for emergencies)
+                messages.append("Overriding this warning due to --force")
+                for msg in messages:
+                    warn(msg)  # Show as warnings, but continue
+            else:
+                # Show as errors and exit
+                for msg in messages:
+                    error(msg)
+                info("You can override this warning with --force")
+                return 2
+
+        # ---------------------------------------------------------------------
+        # EXECUTE APPLIES
+        # ---------------------------------------------------------------------
+
+        if args.dry_run:
+            info("Stopping here due to --dry-run")
+        elif not applyall.empty():
+            # Run all applies in parallel
+            applyall.run()
+
+            # Generate summary report
+            applyall.generate_summary()
+
+            # Return based on success/failure
+            return 0 if applyall.success() else 1
+
+        return 0
+
+    finally:
+        # ---------------------------------------------------------------------
+        # RESTORE ORIGINAL DIRECTORY
+        # ---------------------------------------------------------------------
+        # Always restore the original directory, even if an exception occurred.
+        # This is like Go's defer or Bash's trap cleanup.
+        # ---------------------------------------------------------------------
+        os.chdir(original_dir)
+
+
+# =============================================================================
+# SCRIPT ENTRY POINT
+# =============================================================================
+#
+# __name__ == "__main__" ensures main() only runs when executed directly,
+# not when imported as a module.
+#
+# sys.exit(main()) passes the return code from main() to the shell.
+# =============================================================================
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""
+Terragrunt Plan All - Run terragrunt plans in parallel across multiple providers.
+
+This script orchestrates running `terragrunt plan` across multiple modules/providers
+and generates consolidated reports organized by JIRA ticket.
+
+Usage:
+    terragrunt_plan_all [OPTIONS] [TICKET] [paths...]
+
+Examples:
+    # Plan changes for a ticket based on modified modules
+    ./terragrunt_plan_all INFRA-1234 modules/my-service
+
+    # Plan from git diff against main
+    ./terragrunt_plan_all --from-branch main
+
+    # Replan only failed plans
+    ./terragrunt_plan_all INFRA-1234 --replan errors
+
+    # Dry run with filter
+    ./terragrunt_plan_all --dry-run -f us-east-1
+
+# =============================================================================
+# PYTHON CONCEPTS FOR GO/BASH DEVELOPERS
+# =============================================================================
+#
+# This file demonstrates these Python concepts:
+#
+# 1. Shebang Line (#!/usr/bin/env python3):
+#    - Tells the OS which interpreter to use when running as ./script.py
+#    - Using "env python3" makes it portable across systems
+#    - Bash equivalent: #!/bin/bash
+#
+# 2. argparse Module:
+#    - Python's standard library for parsing command-line arguments
+#    - Similar to Go's flag package but more powerful
+#    - Supports positional args, optional args, subcommands, help generation
+#    - Bash equivalent: getopts or manual $1, $2, etc. parsing
+#
+# 3. __name__ == "__main__" Guard:
+#    - Python executes all top-level code when importing a module
+#    - This guard prevents main() from running when imported as a library
+#    - Code inside this block only runs when script is executed directly
+#    - Go doesn't have this - main package can't be imported
+#
+# 4. sys.path Manipulation:
+#    - sys.path is the list of directories Python searches for imports
+#    - We add the script's directory so we can import from lib/
+#    - Go uses go.mod/go.sum for module resolution instead
+#
+# 5. Return Codes:
+#    - main() returns an integer exit code (0 = success, non-zero = error)
+#    - sys.exit(main()) passes this to the shell
+#    - Same concept as Go's os.Exit() or Bash's exit command
+#
+# =============================================================================
+"""
+
+# =============================================================================
+# STANDARD LIBRARY IMPORTS
+# =============================================================================
+
+import os              # Operating system interface (chdir, environ)
+import re              # Regular expressions for pattern matching (filters)
+import sys             # System-specific parameters (path, exit, argv)
+import argparse        # Command-line argument parsing
+from pathlib import Path           # Object-oriented filesystem paths
+from typing import List, Optional  # Type hints for better code clarity
+
+# =============================================================================
+# PATH SETUP FOR LOCAL IMPORTS
+# =============================================================================
+#
+# Python needs to know where to find our lib/ modules. We add the script's
+# directory to sys.path so "from lib.xxx import yyy" works.
+#
+# __file__ is the path to this script
+# Path(__file__).parent.resolve() gets the absolute path to the script's directory
+# sys.path.insert(0, ...) adds it to the front of the search path
+#
+# This is similar to Go's module system but manual. In Go, you'd define
+# the module in go.mod and imports would just work.
+#
+# Bash equivalent would be:
+#   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+#   source "$SCRIPT_DIR/lib/common.sh"
+# =============================================================================
+
+script_dir = Path(__file__).parent.resolve()
+sys.path.insert(0, str(script_dir))
+
+# =============================================================================
+# LOCAL MODULE IMPORTS
+# =============================================================================
+#
+# Now that sys.path includes our script directory, we can import from lib/
+#
+# The "from lib.xxx import yyy" syntax imports specific items from a module.
+# This is like Go's import with dot alias: import . "package"
+# =============================================================================
+
+from lib.common import (
+    ReplanType,        # Enum with replan type constants (all, changes, errors, none)
+    debug,             # Print debug messages (only if verbose)
+    info,              # Print informational messages
+    warn,              # Print warning messages (yellow)
+    error,             # Print error messages (red)
+    set_verbose,       # Function to enable/disable verbose mode
+)
+
+# TerraformProject detects project structure and parses paths
+# find_project_diffs finds changed files between git branches
+from lib.project import TerraformProject, find_project_diffs
+
+# TerragruntPlanAll orchestrates parallel plan execution
+from lib.plan_all import TerragruntPlanAll
+
+
+# =============================================================================
+# ARGUMENT PARSING FUNCTION
+# =============================================================================
+#
+# This function defines and parses all command-line arguments using argparse.
+#
+# ARGPARSE OVERVIEW:
+# - ArgumentParser creates the parser object
+# - add_argument() defines each argument
+# - parse_args() processes sys.argv and returns a Namespace object
+#
+# ARGUMENT TYPES:
+# - Positional: Required args in order (e.g., "TICKET")
+# - Optional: Start with - or -- (e.g., "--dry-run")
+# - Flags: Boolean options with action="store_true"
+# - Values: Options that take a value (type=int, default=5)
+# - Repeatable: Can be specified multiple times (action="append")
+#
+# COMPARISON TO GO FLAG PACKAGE:
+#   Go:     concurrency := flag.Int("j", 5, "concurrency level")
+#   Python: parser.add_argument("-j", type=int, default=5)
+#
+# COMPARISON TO BASH GETOPTS:
+#   Bash:   while getopts "j:f:" opt; do ... done
+#   Python: Much more automatic - handles help, types, defaults
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace object with all parsed arguments as attributes.
+        Access them like: args.dry_run, args.concurrency, args.filter
+
+    IMPORTANT: argparse converts dashes to underscores in attribute names.
+    So --dry-run becomes args.dry_run
+    """
+    # -------------------------------------------------------------------------
+    # CREATE ARGUMENT PARSER
+    # -------------------------------------------------------------------------
+    # description: Shown at the top of --help output
+    # formatter_class: RawDescriptionHelpFormatter preserves formatting in epilog
+    # epilog: Shown at the bottom of --help output (examples)
+    # -------------------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        description="Run terragrunt plans in parallel across multiple providers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s INFRA-1234 modules/my-service    Plan specific module for ticket
+  %(prog)s --from-branch main               Plan changes from git diff
+  %(prog)s INFRA-1234 --replan errors       Replan only failed plans
+  %(prog)s --dry-run -f us-east-1           Preview filtered plans
+        """,
+    )
+
+    # -------------------------------------------------------------------------
+    # POSITIONAL ARGUMENTS (TICKET and PATHS)
+    # -------------------------------------------------------------------------
+    #
+    # nargs="*" means "zero or more arguments" - collects into a list
+    # The script intelligently parses these to determine if each is a:
+    # - JIRA ticket number (INFRA-1234, INFRA-5678)
+    # - Module path (modules/my-service)
+    # - Provider path (providers/dev/us-east-1/service)
+    # - Variables file path
+    #
+    # Go equivalent: flag.Args() returns remaining positional arguments
+    # Bash equivalent: "$@" gives all arguments, shift processes them
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "args",
+        nargs="*",                    # Zero or more arguments
+        metavar="TICKET/PATH",        # How it appears in help text
+        help="JIRA ticket (INFRA-xxx) and/or provider/module/variable paths",
+    )
+
+    # -------------------------------------------------------------------------
+    # EXECUTION OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # action="store_true" makes it a boolean flag:
+    # - Absent: args.dry_run = False
+    # - Present (--dry-run): args.dry_run = True
+    #
+    # This is like Go's flag.Bool() or Bash's presence check [[ -n "$FLAG" ]]
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only show what plans would be run and exit",
+    )
+
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove previous plan directory before starting",
+    )
+
+    parser.add_argument(
+        "--keep-empty",
+        action="store_true",
+        help="Keep plans even if they do not produce any changes",
+    )
+
+    # -------------------------------------------------------------------------
+    # CONCURRENCY OPTION
+    # -------------------------------------------------------------------------
+    #
+    # This shows several argparse features:
+    # - Short form (-j) and long form (--concurrency)
+    # - type=int: Converts the string argument to integer
+    # - default: Uses environment variable with fallback
+    # - metavar: What to show in help ("N" instead of "CONCURRENCY")
+    #
+    # os.environ.get("CONCURRENCY", 5) is like:
+    #   Bash: ${CONCURRENCY:-5}
+    #   Go:   os.Getenv("CONCURRENCY") with default handling
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "-j", "--concurrency",
+        type=int,
+        default=int(os.environ.get("CONCURRENCY", 5)),  # Default from env or 5
+        metavar="N",
+        help="Run plans in parallel (default: %(default)s)",  # %(default)s shows default value
+    )
+
+    parser.add_argument(
+        "--destroy",
+        action="store_true",
+        help="Generate a destroy plan",
+    )
+
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop after first plan fails",
+    )
+
+    parser.add_argument(
+        "--unmask-output",
+        action="store_true",
+        help="Do not mask sensitive info in plan output",
+    )
+
+    # -------------------------------------------------------------------------
+    # REFRESH AND CACHE OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # These options control terraform/terragrunt behavior.
+    # Note how we handle mutually exclusive options:
+    # - --refresh (default=False) enables refresh
+    # - --no-refresh disables it
+    # Later in main(), we combine them: args.refresh and not args.no_refresh
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Do refresh before plan",
+    )
+
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Skip refresh before plan (default)",
+    )
+
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        default=True,
+        help="Keep terragrunt cache directory (default)",
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Remove terragrunt cache directory before plan",
+    )
+
+    # -------------------------------------------------------------------------
+    # REPLAN OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # choices=ReplanType.VALID_TYPES restricts valid values
+    # If user provides invalid choice, argparse shows error automatically
+    #
+    # VALID_TYPES = ["all", "changes", "errors", "none"]
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "--replan",
+        choices=ReplanType.VALID_TYPES,  # Only allow specific values
+        metavar="TYPE",
+        help="Repeat a previous plan: all, changes, errors, or none",
+    )
+
+    # -------------------------------------------------------------------------
+    # GIT INTEGRATION
+    # -------------------------------------------------------------------------
+    parser.add_argument(
+        "--from-branch",
+        metavar="BRANCH",
+        help="Plan based on files changed between BRANCH and current branch",
+    )
+
+    # -------------------------------------------------------------------------
+    # FILTER OPTIONS
+    # -------------------------------------------------------------------------
+    #
+    # action="append" collects multiple values into a list:
+    #   -f foo -f bar  ->  args.filter = ["foo", "bar"]
+    #
+    # default=[] starts with empty list (important for append)
+    #
+    # Bash equivalent: Multiple -f flags collected into an array
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-f", "--filter",
+        action="append",              # Collect multiple values
+        default=[],                   # Start with empty list
+        metavar="REGEX",
+        help="Include providers matching regex (can be repeated)",
+    )
+
+    parser.add_argument(
+        "-F", "--exclude-filter",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Exclude providers matching regex (can be repeated)",
+    )
+
+    # Convenience shortcuts for common filters
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Equivalent to -f /dev/",
+    )
+
+    parser.add_argument(
+        "--prod",
+        action="store_true",
+        help="Equivalent to -F /dev/",
+    )
+
+    # -------------------------------------------------------------------------
+    # VARIABLES AND TARGETS
+    # -------------------------------------------------------------------------
+    #
+    # These pass values through to terraform plan:
+    # -v KEY=VALUE becomes: terraform plan -var="KEY=VALUE"
+    # -t resource becomes: terraform plan -target=resource
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "-v", "--var",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Pass override variables to plan (can be repeated)",
+    )
+
+    parser.add_argument(
+        "-t", "--target",
+        action="append",
+        default=[],
+        metavar="VALUE",
+        help="Pass -target=VALUE to plan (can be repeated)",
+    )
+
+    # -------------------------------------------------------------------------
+    # LIMITS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--limit-per-module",
+        type=int,
+        metavar="N",
+        help="Run only up to N plans per given (top-level) module",
+    )
+
+    parser.add_argument(
+        "--tags-only",
+        action="store_true",
+        help="Discard plans that have non-tag changes",
+    )
+
+    # -------------------------------------------------------------------------
+    # OUTPUT OPTIONS
+    # -------------------------------------------------------------------------
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+
+    # -------------------------------------------------------------------------
+    # PARSE AND RETURN
+    # -------------------------------------------------------------------------
+    # parse_args() processes sys.argv[1:] (all args except script name)
+    # Returns a Namespace object where args are accessible as attributes
+    # -------------------------------------------------------------------------
+    return parser.parse_args()
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def compile_filters(patterns: List[str]) -> List[re.Pattern]:
+    """
+    Compile regex patterns, exiting on error.
+
+    Args:
+        patterns: List of regex pattern strings (e.g., ["/dev/", "us-east-1"])
+
+    Returns:
+        List of compiled regex Pattern objects
+
+    REGEX COMPILATION:
+    - re.compile() converts a string pattern to a compiled regex
+    - Compiled regex is faster if used multiple times
+    - re.error is raised if pattern is invalid
+
+    PYTHON CONCEPT - Type Hints:
+    - List[str] means "list of strings"
+    - List[re.Pattern] means "list of compiled regex patterns"
+    - These are hints for IDEs and type checkers, not enforced at runtime
+
+    Go equivalent:
+        patterns := make([]*regexp.Regexp, 0)
+        for _, p := range input {
+            re, err := regexp.Compile(p)
+            if err != nil { return nil, err }
+            patterns = append(patterns, re)
+        }
+    """
+    compiled = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as e:
+            # Invalid regex pattern - show error and exit
+            error(f"Invalid regex pattern '{pattern}': {e}")
+            sys.exit(2)  # Exit code 2 = invalid argument
+    return compiled
+
+
+def parse_variables(var_args: List[str]) -> dict:
+    """
+    Parse KEY=VALUE variable arguments.
+
+    Args:
+        var_args: List of "KEY=VALUE" strings from -v/--var options
+
+    Returns:
+        Dictionary mapping keys to values
+
+    Example:
+        parse_variables(["foo=bar", "count=5"])
+        Returns: {"foo": "bar", "count": "5"}
+
+    PYTHON CONCEPT - String Split:
+    - var.split("=", 1) splits on first "=" only
+    - Returns ["key", "value=with=equals"] not ["key", "value", "with", "equals"]
+
+    Go equivalent:
+        parts := strings.SplitN(var, "=", 2)
+        if len(parts) != 2 { return error }
+    """
+    variables = {}
+    for var in var_args:
+        if "=" not in var:
+            error(f"Invalid variable format: {var} (expected KEY=VALUE)")
+            sys.exit(2)
+        key, value = var.split("=", 1)  # Split on first = only
+        variables[key] = value
+    return variables
+
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+#
+# This is the entry point for the script. It:
+# 1. Parses command-line arguments
+# 2. Initializes the project
+# 3. Parses positional arguments (ticket, modules, providers)
+# 4. Handles special modes (--from-branch, --replan)
+# 5. Creates and runs the TerragruntPlanAll operation
+# 6. Returns an exit code (0 = success, non-zero = error)
+#
+# RETURN CODES:
+# - 0: Success
+# - 1: Runtime error (e.g., plan failed, no project found)
+# - 2: Invalid arguments (e.g., bad regex, missing ticket)
+#
+# Go equivalent: func main() with os.Exit(code) at the end
+# Bash equivalent: main() { ... } with exit $?
+# =============================================================================
+
+def main() -> int:
+    """
+    Main entry point.
+
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
+    # Parse command-line arguments
+    args = parse_args()
+
+    # -------------------------------------------------------------------------
+    # SET VERBOSE MODE
+    # -------------------------------------------------------------------------
+    # set_verbose() is a function in lib/common.py that enables debug output
+    # Must be called before any debug() calls will produce output
+    # -------------------------------------------------------------------------
+    if args.verbose:
+        set_verbose(True)
+
+    # -------------------------------------------------------------------------
+    # INITIALIZE PROJECT
+    # -------------------------------------------------------------------------
+    #
+    # TerraformProject() auto-detects the project root by looking for
+    # providers/ and modules/ directories, walking up from current directory.
+    #
+    # If not found, raises RuntimeError.
+    #
+    # try/except is Python's error handling, like Go's if err != nil
+    # -------------------------------------------------------------------------
+    try:
+        project = TerraformProject()
+    except RuntimeError as e:
+        if str(e):  # Only show error if there's a message
+            error(str(e))
+        return 1
+
+    debug(f"Found {project} in {project.root}")
+
+    # -------------------------------------------------------------------------
+    # PARSE POSITIONAL ARGUMENTS
+    # -------------------------------------------------------------------------
+    #
+    # The script accepts a mix of ticket numbers and paths.
+    # We iterate through args.args and classify each one.
+    #
+    # project.parse_argument() returns a tuple:
+    # - ("ticket", ["INFRA-1234"]) for ticket numbers
+    # - ("module", ["providers/dev/...", ...]) for module paths
+    # - ("provider", ["providers/dev/..."]) for provider paths
+    # - ("variables", ["env.tfvars"]) for variable files
+    # - (None, None) for unknown paths
+    #
+    # PYTHON CONCEPT - Optional Type:
+    # Optional[str] means "str or None"
+    # Same as Go's *string (pointer can be nil)
+    # -------------------------------------------------------------------------
+
+    ticket: Optional[str] = None      # Will hold JIRA ticket if provided
+    providers: List[str] = []         # List of provider paths
+    modules: List[str] = []           # List of module paths
+    variables: List[str] = []         # List of variable file paths
+
+    for arg in args.args:
+        arg_type, paths = project.parse_argument(arg)
+
+        if arg_type == "ticket":
+            ticket = paths[0]
+        elif arg_type == "module":
+            modules.extend(paths)      # extend() adds all items from list
+        elif arg_type == "provider":
+            providers.extend(paths)
+        elif arg_type == "variables":
+            variables.extend(paths)
+        else:
+            error(f"{arg} is not a valid ticket number, module, or provider path")
+            return 2
+
+    # -------------------------------------------------------------------------
+    # HANDLE --from-branch MODE
+    # -------------------------------------------------------------------------
+    #
+    # --from-branch automatically finds changed files between the specified
+    # branch and current branch, then plans those changes.
+    #
+    # This is mutually exclusive with --replan and explicit paths.
+    # -------------------------------------------------------------------------
+
+    if args.from_branch:
+        if args.replan:
+            error("--from-branch cannot be used with --replan")
+            return 2
+        if modules or providers or variables:
+            error("--from-branch cannot be used with path arguments")
+            return 2
+
+        # Find files that differ from the specified branch
+        diffs = find_project_diffs(project, args.from_branch)
+        if not diffs:
+            info(f"No differences from {args.from_branch} branch")
+            return 0
+
+        # Parse each diff path and categorize it
+        for diff_path in diffs:
+            arg_type, paths = project.parse_argument(diff_path)
+            if arg_type == "module":
+                modules.extend(paths)
+            elif arg_type == "provider":
+                providers.extend(paths)
+            elif arg_type == "variables":
+                variables.extend(paths)
+
+    # -------------------------------------------------------------------------
+    # AUTO-DETECT TICKET AND PATHS
+    # -------------------------------------------------------------------------
+    #
+    # If user didn't provide ticket/paths, try to auto-detect:
+    # 1. Ticket from git branch name (if branch matches ticket pattern)
+    # 2. Ticket from current directory (if in tickets/INFRA-1234/)
+    # 3. Module/provider from current directory (if in modules/ or providers/)
+    #
+    # This makes the script convenient to use without typing everything.
+    # -------------------------------------------------------------------------
+
+    # Parse current working directory
+    pwd_type, pwd_paths = project.parse_argument(str(Path.cwd()))
+    debug(f"Current directory parsed as: {pwd_type}, {pwd_paths}")
+
+    # Try to detect ticket from git branch name
+    if ticket is None:
+        branch = project.current_git_branch()
+        if project.ticket_regex.match(branch):
+            debug(f"Assuming ticket {branch} based on current git branch")
+            ticket = branch
+
+    # Try to detect ticket from current directory
+    if ticket is None and pwd_type == "ticket":
+        debug(f"Assuming ticket {pwd_paths[0]} based on current directory")
+        ticket = pwd_paths[0]
+
+    # Auto-detect module/provider from current directory
+    if args.replan is None and not providers and not modules:
+        if pwd_type == "module":
+            debug(f"Assuming module {pwd_paths} based on current directory")
+            modules.extend(pwd_paths)
+        elif pwd_type == "provider":
+            debug(f"Assuming provider {pwd_paths} based on current directory")
+            providers.extend(pwd_paths)
+
+    # -------------------------------------------------------------------------
+    # DEBUG LOGGING
+    # -------------------------------------------------------------------------
+    debug(f"ticket    = {ticket}")
+    debug(f"modules   = {modules}")
+    debug(f"variables = {variables}")
+    debug(f"providers = {providers}")
+    debug(f"filters   = {args.filter}")
+
+    # -------------------------------------------------------------------------
+    # VALIDATE REQUIRED PARAMETERS
+    # -------------------------------------------------------------------------
+
+    if ticket is None:
+        error(f"Ticket required if not on {project.jira} branch")
+        return 2
+
+    # Clean up ticket name (remove trailing slash if any)
+    ticket = ticket.rstrip("/")
+    if "/" in ticket:
+        error("Ticket cannot contain /")
+        return 2
+
+    # -------------------------------------------------------------------------
+    # VALIDATE REPLAN MODE
+    # -------------------------------------------------------------------------
+    #
+    # --replan requires an existing plan to rerun.
+    # It cannot be combined with explicit paths.
+    # -------------------------------------------------------------------------
+
+    if args.replan:
+        report_file = project.root / "tickets" / ticket / "plan_all_report.txt"
+        if not report_file.exists():
+            error(f"No existing plan in tickets/{ticket}")
+            return 1
+        if providers or modules:
+            error("--replan cannot be used with explicit providers or modules")
+            return 2
+    else:
+        if not providers and not modules and not variables:
+            error("One or more providers, modules, or variables files required unless using --replan")
+            return 2
+
+    # -------------------------------------------------------------------------
+    # BUILD COMMAND OPTIONS DICTIONARY
+    # -------------------------------------------------------------------------
+    #
+    # This dictionary is passed to TerragruntPlanAll and eventually to
+    # each TerragruntPlan instance. It contains all the configuration
+    # from command-line arguments.
+    #
+    # PYTHON CONCEPT - Dictionary Literal:
+    # {"key": value, ...} creates a dictionary (like Go's map[string]interface{})
+    # -------------------------------------------------------------------------
+
+    cmd_options = {
+        "replan": args.replan,
+        "keep_empty": args.keep_empty,
+        "concurrency": args.concurrency,
+        "destroy": args.destroy,
+        "stop_on_error": args.stop_on_error,
+        "mask_output": not args.unmask_output,  # Inverted: --unmask-output disables masking
+        "refresh": args.refresh and not args.no_refresh,  # Combine both flags
+        "tg_cache": args.cache and not args.no_cache,     # Combine both flags
+        "tags_only": args.tags_only,
+        "tfvars": parse_variables(args.var),    # Parse KEY=VALUE pairs
+        "tftargets": args.target,               # List of target resources
+    }
+
+    # -------------------------------------------------------------------------
+    # BUILD FILTERS
+    # -------------------------------------------------------------------------
+    #
+    # Compile regex patterns for include and exclude filters.
+    # Also apply --dev and --prod shortcuts.
+    # -------------------------------------------------------------------------
+
+    filters = compile_filters(args.filter)
+    exclude_filters = compile_filters(args.exclude_filter)
+
+    # Apply convenience shortcuts
+    if args.dev:
+        filters.append(re.compile(r"/dev/"))
+    if args.prod:
+        exclude_filters.append(re.compile(r"/dev/"))
+
+    # -------------------------------------------------------------------------
+    # CHANGE TO PROJECT ROOT
+    # -------------------------------------------------------------------------
+    #
+    # The plan operations expect to run from the project root.
+    # We save the original directory to restore it in the finally block.
+    #
+    # os.chdir() changes the current working directory
+    # Path.cwd() gets the current working directory
+    #
+    # Go equivalent: os.Chdir() / os.Getwd()
+    # Bash equivalent: cd / pwd
+    # -------------------------------------------------------------------------
+
+    original_dir = Path.cwd()
+    os.chdir(project.root)
+
+    try:
+        # ---------------------------------------------------------------------
+        # CREATE PLAN-ALL OPERATION
+        # ---------------------------------------------------------------------
+        planall = TerragruntPlanAll(project, ticket, cmd_options)
+
+        # ---------------------------------------------------------------------
+        # LOAD OR FIND PROVIDERS
+        # ---------------------------------------------------------------------
+        #
+        # --replan mode: Load providers from existing plan files
+        # Normal mode: Find providers from given modules/providers/variables
+        # ---------------------------------------------------------------------
+
+        if args.replan:
+            # Load existing plans from ticket directory
+            planall.load_providers()
+        else:
+            # Check if we should load existing plans first
+            if args.clean or not planall.summaryfile.exists():
+                pass  # Start fresh - don't load existing plans
+            else:
+                # Load existing plans so we can add to them
+                planall.load_providers()
+
+            # Find providers matching the given arguments
+            planall.find_providers(providers)
+            planall.find_modules(modules)
+            planall.find_variables(variables)
+
+        # ---------------------------------------------------------------------
+        # APPLY FILTERS
+        # ---------------------------------------------------------------------
+        planall.apply_filters(filters, exclude_filters, args.limit_per_module)
+
+        # ---------------------------------------------------------------------
+        # SHOW PLAN PREVIEW
+        # ---------------------------------------------------------------------
+        planall.show_plans()
+
+        # ---------------------------------------------------------------------
+        # EXECUTE PLANS
+        # ---------------------------------------------------------------------
+
+        if args.dry_run:
+            info("Stopping here due to --dry-run")
+        elif not planall.empty():
+            # Clean old plans if requested
+            if args.clean:
+                planall.clean()
+
+            # Run all plans in parallel
+            planall.run()
+
+            # Generate summary report
+            planall.generate_summary()
+
+            # Remove empty plans unless --keep-empty
+            if not args.keep_empty:
+                planall.prune_empty()
+
+            # Return based on success/failure
+            return 0 if planall.success() else 1
+
+        return 0
+
+    finally:
+        # ---------------------------------------------------------------------
+        # RESTORE ORIGINAL DIRECTORY
+        # ---------------------------------------------------------------------
+        # The finally block always runs, even if an exception occurred.
+        # This ensures we return to the original directory.
+        #
+        # Go equivalent: defer os.Chdir(originalDir)
+        # ---------------------------------------------------------------------
+        os.chdir(original_dir)
+
+
+# =============================================================================
+# SCRIPT ENTRY POINT
+# =============================================================================
+#
+# __name__ == "__main__" check:
+# - When Python runs a script directly, __name__ is set to "__main__"
+# - When a module is imported, __name__ is set to the module name
+# - This check ensures main() only runs when script is executed directly
+#
+# sys.exit(main()):
+# - Calls main() and passes its return value to sys.exit()
+# - sys.exit() terminates with the given exit code
+# - Exit code 0 = success, non-zero = error
+#
+# Go doesn't need this pattern - main package can't be imported.
+# Bash equivalent: Just call main at the end of the script.
+# =============================================================================
+
+if __name__ == "__main__":
+    sys.exit(main())
