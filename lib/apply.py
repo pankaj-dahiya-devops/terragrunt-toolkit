@@ -527,12 +527,14 @@ class TerragruntApply:
             if not self.errors:
                 self.errors.append(err)
             output.write(f"\nError: {err}\n")
+            output.flush()
         elif self.summary is None:
             # Apply completed but we couldn't parse the result
             err = "Could not determine terragrunt result"
             self.status = PlanStatus.ERROR
             self.errors.append(err)
             output.write(f"\nError: {err}\n")
+            output.flush()
 
     def _parse_terragrunt_output(self, input_stream: TextIO, output: Optional[TextIO] = None) -> None:
         """
@@ -552,6 +554,7 @@ class TerragruntApply:
                 self.errors.append(msg)
                 if output:
                     output.write(f"Error: {msg}\n")
+                    output.flush()
                 self._stop_terragrunt()
                 return
 
@@ -599,6 +602,7 @@ class TerragruntApply:
             # Write all output to file (unlike plan, we keep everything)
             if output:
                 output.write(line + "\n")
+                output.flush()  # Flush after each line so file is readable while apply is running
 
     def _handle_terragrunt_output_line(self, line: str, output: Optional[TextIO]) -> None:
         """
