@@ -427,8 +427,8 @@ class TerragruntApply:
         This method:
         1. Builds the appropriate command (apply or destroy)
         2. Optionally clears terragrunt cache
-        3. Runs terragrunt init (and optionally refresh)
-        4. Runs terragrunt apply/destroy
+        3. Optionally runs terragrunt refresh
+        4. Runs terragrunt apply/destroy (terragrunt auto-inits if needed)
         5. Parses output line by line
 
         IMPORTANT: Destroy plans require --allow-destroy flag!
@@ -470,9 +470,6 @@ class TerragruntApply:
             cache_dir = self._get_terragrunt_cache()
             if cache_dir:
                 commands.append(f"rm -rf {_shell_quote(cache_dir)}")
-
-        # Always run init first
-        commands.append("terragrunt init -input=false -no-color")
 
         # Optional refresh before apply
         if self.cmd_options.get("refresh"):

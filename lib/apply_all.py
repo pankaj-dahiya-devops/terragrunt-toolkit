@@ -735,7 +735,9 @@ class TerragruntApplyAll:
 
             # Group plans into waves via topological sort
             # Each wave's plans have no unmet dependencies on each other
-            waves = _build_waves(self.plans, dep_map)
+            # For destroy plans, dependency order is reversed (dependents destroyed first)
+            is_destroy = all(p.destroy for p in self.plans)
+            waves = _build_waves(self.plans, dep_map, destroy=is_destroy)
 
             # Log wave breakdown if more than one wave (i.e., there are deps)
             if len(waves) > 1:
@@ -1181,6 +1183,7 @@ def _parse_provider_deps(project: "TerraformProject", provider: str) -> List[str
 def _build_waves(
     plans: List[TerragruntApply],
     dep_map: Dict[str, List[str]],
+    destroy: bool = False,
 ) -> List[List[TerragruntApply]]:
     """
     Group plans into execution waves using topological sort (Kahn's algorithm).
@@ -1192,6 +1195,9 @@ def _build_waves(
         plans:   List of TerragruntApply instances to execute
         dep_map: Dict mapping provider path -> list of dependency provider paths
                  (from _parse_provider_deps)
+        destroy: If True, reverse the dependency graph so dependents are
+                 destroyed before their dependencies (e.g., security-groups
+                 before vpc, not vpc before security-groups)
 
     Returns:
         List of waves. Each wave is a list of TerragruntApply instances
@@ -1204,8 +1210,15 @@ def _build_waves(
         3. Add that group as a wave, mark them completed
         4. Repeat until remaining is empty
 
-    EXAMPLE:
-        plans = [vpc, security-groups, rds, ecs]
+    DEPENDENCY DIRECTION:
+        Apply:   vpc must exist before security-groups can be created
+                 → Wave 1: vpc, Wave 2: security-groups
+        Destroy: security-groups must be destroyed before vpc can be destroyed
+                 → Wave 1: security-groups, Wave 2: vpc
+        For destroy, we transpose the graph (flip all edges) so the same
+        Kahn's algorithm produces the correct reversed order.
+
+    EXAMPLE (apply):
         dep_map = {
             "providers/.../security-groups": ["providers/.../vpc"],
             "providers/.../rds":             ["providers/.../vpc"],
@@ -1214,8 +1227,14 @@ def _build_waves(
         }
         Result:
             Wave 1: [vpc]
-            Wave 2: [security-groups, rds]   # both deps on vpc (now completed)
-            Wave 3: [ecs]                    # deps on wave 2 (now completed)
+            Wave 2: [security-groups, rds]
+            Wave 3: [ecs]
+
+    EXAMPLE (destroy, same dep_map, graph transposed):
+        Result:
+            Wave 1: [ecs]
+            Wave 2: [security-groups, rds]
+            Wave 3: [vpc]
 
     EDGE CASES:
         - No deps: All plans in one wave (identical to old flat behavior)
@@ -1224,7 +1243,7 @@ def _build_waves(
           running all remaining in one wave (with a warning)
 
     Go equivalent:
-        func buildWaves(plans []*Apply, depMap map[string][]string) [][]*Apply {
+        func buildWaves(plans []*Apply, depMap map[string][]string, destroy bool) [][]*Apply {
             // Kahn's algorithm...
         }
     """
@@ -1233,6 +1252,21 @@ def _build_waves(
 
     # Map provider path -> TerragruntApply for quick lookup
     provider_to_plan = {p.provider: p for p in plans}
+
+    # For destroy operations, transpose the dependency graph.
+    # Original edge:  security-groups -> vpc  (security-groups depends on vpc)
+    # Transposed edge: vpc -> security-groups  (vpc must wait for security-groups)
+    # This makes security-groups appear before vpc in Kahn's sort, which is
+    # correct: destroy dependents before destroying their dependencies.
+    if destroy:
+        transposed: Dict[str, List[str]] = {p: [] for p in plan_providers}
+        for provider, deps in dep_map.items():
+            for dep in deps:
+                if dep in plan_providers:
+                    transposed[dep].append(provider)
+        effective_dep_map = transposed
+    else:
+        effective_dep_map = dep_map
 
     # Providers still waiting to be assigned to a wave
     remaining = set(plan_providers)
@@ -1252,7 +1286,7 @@ def _build_waves(
             for p in remaining
             if all(
                 d in completed or d not in plan_providers
-                for d in dep_map.get(p, [])
+                for d in effective_dep_map.get(p, [])
             )
         ]
 
