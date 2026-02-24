@@ -683,8 +683,8 @@ class TerragruntPlan:
         This method:
         1. Builds the terragrunt command with all options
         2. Optionally clears the terragrunt cache
-        3. Runs terragrunt init (and optionally refresh)
-        4. Runs terragrunt plan
+        3. Optionally runs terragrunt refresh
+        4. Runs terragrunt plan (terragrunt auto-inits if needed)
         5. Parses output line by line
 
         Python TextIO:
@@ -745,9 +745,6 @@ class TerragruntPlan:
             cache_dir = self._get_terragrunt_cache()
             if cache_dir:
                 commands.append(f"rm -rf {_shell_quote(cache_dir)}")
-
-        # Always run init first
-        commands.append("terragrunt init -input=false -no-color")
 
         # Optional refresh before plan
         if self.cmd_options.get("refresh"):
