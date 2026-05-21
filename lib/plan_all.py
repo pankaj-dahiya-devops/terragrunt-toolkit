@@ -225,8 +225,13 @@ class TerragruntPlanAll:
                 line = line.rstrip("\n")
 
                 # Detect section headers to determine status
-                if line in [ERROR_PLANS_HEADER, SKIPPED_PLANS_HEADER]:
+                if line == ERROR_PLANS_HEADER:
                     status = PlanStatus.ERROR
+                elif line == SKIPPED_PLANS_HEADER:
+                    # Skipped plans are already listed under their real status sections
+                    # (SUCCESS/NOCHANGE/ERROR) earlier in the file, so don't re-process
+                    # them here — doing so would overwrite their correct status with ERROR.
+                    status = None
                 elif line == NO_CHANGE_PLANS_HEADER:
                     status = PlanStatus.NOCHANGE
                 elif line == SUCCESSFUL_PLANS_HEADER:
@@ -915,7 +920,11 @@ class TerragruntPlanAll:
             for plan in self.plans_by_status(PlanStatus.SUCCESS):
                 tee(plan.statusline())
 
-            # Skipped plans (from --replan)
+            # Skipped plans (from --replan) — for display only.
+            # These plans are already shown in their proper status sections above
+            # (with a "(Not re-run)" prefix via statusline()), so this section is
+            # purely a convenience list for human readers. It is intentionally
+            # ignored by load_providers() to avoid overwriting their correct status.
             skipped = [p for p in self.plans if not p.should_run]
             if skipped:
                 tee(f"\n{SKIPPED_PLANS_HEADER}\n")
