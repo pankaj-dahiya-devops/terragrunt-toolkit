@@ -26,7 +26,7 @@ This toolkit wraps Terragrunt commands to:
 |--------|-------------|
 | `terragrunt_plan_all` | Run terragrunt plans in parallel across providers |
 | `terragrunt_apply_all` | Apply saved plans from a ticket directory |
-| `terragrunt_unlock_all` | Remove stale S3 state lock files |
+| `terragrunt_unlock_all` | Detect and remove stale Terraform state locks (AWS and Azure) |
 | `terragrunt_format` | Filter and clean up terragrunt plan output |
 
 ## Requirements
@@ -35,7 +35,6 @@ This toolkit wraps Terragrunt commands to:
 - Terragrunt installed and in PATH
 - Terraform installed and in PATH
 - Git (for project detection and branch-based planning)
-- boto3 (for S3 unlock functionality only)
 
 ## Installation
 
@@ -62,8 +61,9 @@ chmod +x terragrunt_plan_all terragrunt_apply_all terragrunt_unlock_all terragru
 # Apply all plans for a ticket
 ./terragrunt_apply_all INFRA-1234
 
-# List stale S3 lock files (dry run)
-./terragrunt_unlock_all -b my-tfstate-bucket --dry-run
+# Find and remove stale state locks for a ticket (dry run first)
+./terragrunt_unlock_all INFRA-1234 --dry-run
+./terragrunt_unlock_all INFRA-1234
 
 # Filter/clean plan output
 cat plan.txt | ./terragrunt_format
@@ -278,53 +278,83 @@ terragrunt_apply_all [OPTIONS] [TICKET]
 
 ## terragrunt_unlock_all
 
-Remove stale Terraform S3 state lock files (`.tflock` files created by `use_lockfile = true`).
+Find and remove stale Terraform state locks across all providers in a ticket or path.
+Works identically to `terragrunt_plan_all` — run it from anywhere inside your project,
+pass a ticket or provider path, and it does the rest. No backend configuration needed.
+Works with AWS (DynamoDB/S3) and Azure (blob lease) backends.
+
+### How it works
+
+1. **Detection** — runs `terragrunt plan -lock-timeout=0s -refresh=false` in parallel
+   across all providers in scope. With `-lock-timeout=0s`, Terraform fails immediately
+   if it cannot acquire the lock, before doing any planning work. The error output
+   contains the full lock info (ID, Who, Operation, Created).
+
+2. **Display** — lists every locked provider with its lock ID, owner, operation, and
+   creation time. Always shown before any action is taken.
+
+3. **Confirmation** — prompts `Enter 'yes' to force-unlock N provider(s)` unless
+   `--force` is passed. This is mandatory — you always see what will be unlocked.
+
+4. **Unlock** — runs `terraform force-unlock -force <id>` in parallel from the
+   Terragrunt cache directory captured during detection (no dependency resolution
+   needed). Falls back to `terragrunt force-unlock -force <id>` if the cache is
+   unavailable.
 
 ### Usage
 
 ```
-terragrunt_unlock_all [OPTIONS]
+terragrunt_unlock_all [OPTIONS] [TICKET|PATH]
 ```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `TICKET` | JIRA ticket (e.g. `INFRA-1234`) — checks all providers that were part of that ticket's plan |
+| `PATH` | Provider path (e.g. `./providers/dev/azure/eastus`) — checks all providers under that path |
+
+If no argument is given, the ticket is auto-detected from the current git branch name.
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
-| `-b, --bucket BUCKET` | S3 bucket name (required) |
-| `--prefix PREFIX` | S3 key prefix to filter by |
-| `-p, --profile PROFILE` | AWS profile to use |
-| `-r, --region REGION` | AWS region |
-| `-u, --user USER` | Filter by lock owner (default: current user, use `all` for all users) |
-| `-a, --age DURATION` | Filter locks older than specified age (e.g., `6h`, `24h`, `7d`) |
-| `-j N, --concurrency N` | Parallel delete operations (default: 5) |
-| `--confirm` | Delete locks without prompting |
-| `--dry-run` | Show locks but do not delete them |
-| `--verbose` | Enable verbose output |
-
-### Duration Format
-
-Durations can use: `w` (weeks), `d` (days), `h` (hours), `m` (minutes), `s` (seconds)
-
-Examples: `6h`, `24h`, `7d`, `1d12h`
+| `--dry-run` | Show locks but do not unlock anything |
+| `--force` | Skip confirmation prompt and unlock immediately |
+| `-j N, --concurrency N` | Parallel workers for checking and unlocking (default: 5) |
+| `--verbose` | Enable verbose/debug output |
 
 ### Examples
 
 ```bash
-# List all your lock files (dry run)
-./terragrunt_unlock_all -b my-tfstate-bucket --dry-run
+# Check all providers in a ticket for locks and unlock interactively
+./terragrunt_unlock_all INFRA-1234
 
-# List locks for a specific environment
-./terragrunt_unlock_all -b my-tfstate-bucket --prefix env/prod/ --dry-run
+# Check a specific environment path (expands to all providers below)
+./terragrunt_unlock_all ./providers/dev/azure/eastus
 
-# List locks from all users
-./terragrunt_unlock_all -b my-tfstate-bucket -u all --dry-run
+# See what locks exist without unlocking
+./terragrunt_unlock_all INFRA-1234 --dry-run
 
-# Remove locks older than 24 hours
-./terragrunt_unlock_all -b my-tfstate-bucket --age 24h --confirm
+# Unlock without prompting (useful in CI/CD)
+./terragrunt_unlock_all INFRA-1234 --force
 
-# Remove only your own locks with a specific AWS profile
-./terragrunt_unlock_all -b my-tfstate-bucket -p myprofile --confirm
+# Use on a ticket branch — ticket is auto-detected from branch name
+git checkout INFRA-1234-my-feature
+./terragrunt_unlock_all
 ```
+
+### Notes
+
+- **No backend configuration required** — Terragrunt reads its own `terragrunt.hcl`.
+  No storage account names, bucket names, or credentials need to be passed.
+- **Safe by default** — always displays all found locks and asks for confirmation
+  before unlocking. Use `--force` only in automated pipelines.
+- **Works in CI/CD** — in non-interactive mode (no TTY), `--force` is required.
+- **Azure blob leases** — Azure locks are lease-based (write-only restriction).
+  `terragrunt plan -lock-timeout=0s` correctly triggers the lock error; plain
+  state reads (e.g. `state pull`) do not.
 
 ---
 
@@ -388,12 +418,6 @@ The ticket must be either:
 Add to `~/.terraformrc`:
 ```hcl
 plugin_cache_may_break_dependency_lock_file = true
-```
-
-### boto3 not found
-
-```bash
-pip install boto3
 ```
 
 ---
